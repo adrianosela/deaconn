@@ -1,13 +1,11 @@
 package deaconn
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"sync"
 	"time"
 )
 
@@ -19,13 +17,9 @@ type conn struct {
 	ctx       context.Context
 	ctxCancel context.CancelFunc
 
-	buffer *bytes.Buffer
-
-	bufferMutex *sync.Mutex
-
 	readTimer         *time.Timer
 	readTimerChange   chan struct{}
-	readDataAvailable chan struct{}
+	readDataAvailable chan []byte
 }
 
 // WithDeadlines adds support for deadlines to a given net.Conn.
@@ -34,7 +28,7 @@ func WithDeadlines(inner net.Conn) net.Conn {
 
 	// initialize readTimer to a Stop()-ed timer
 	// (a timer that is non-nil but will never fire).
-	readTimer := time.NewTimer(time.Second)
+	readTimer := time.NewTimer(time.Hour)
 	readTimer.Stop()
 
 	c := &conn{
@@ -43,13 +37,9 @@ func WithDeadlines(inner net.Conn) net.Conn {
 		ctx:       ctx,
 		ctxCancel: ctxCancel,
 
-		buffer: bytes.NewBuffer(make([]byte, 10000)),
-
-		bufferMutex: &sync.Mutex{},
-
 		readTimer:         readTimer,
 		readTimerChange:   make(chan struct{}),
-		readDataAvailable: make(chan struct{}),
+		readDataAvailable: make(chan []byte, 1000),
 	}
 
 	go c.continouslyReadIntoBuffer()
@@ -69,16 +59,16 @@ func (c *conn) continouslyReadIntoBuffer() {
 		default:
 			n, err := c.inner.Read(buf)
 			if n > 0 {
-				c.bufferMutex.Lock()
-
-				c.buffer.Write(buf[:n])
-				c.readDataAvailable <- struct{}{}
-
-				c.bufferMutex.Unlock()
+				copied := make([]byte, n)
+				copy(copied, buf[:n])
+				c.readDataAvailable <- copied[:n]
+			} else {
+				c.readDataAvailable <- []byte{}
 			}
 			if err != nil {
 				return
 			}
+
 		}
 	}
 }
@@ -89,16 +79,15 @@ func (c *conn) continouslyReadIntoBuffer() {
 func (c *conn) Read(b []byte) (int, error) {
 	for {
 		select {
-		case <-c.ctx.Done():
-			return 0, io.EOF
-		case <-c.readTimer.C:
-			return 0, os.ErrDeadlineExceeded
+		case data := <-c.readDataAvailable:
+			// TODO: ensure b is big enough for data, e.g. write leftovers to buffer
+			return copy(b, data), nil
 		case <-c.readTimerChange:
 			continue
-		case <-c.readDataAvailable:
-			c.bufferMutex.Lock()
-			defer c.bufferMutex.Unlock()
-			return c.buffer.Read(b)
+		case <-c.readTimer.C:
+			return 0, os.ErrDeadlineExceeded
+		case <-c.ctx.Done():
+			return 0, io.EOF
 		}
 	}
 }
@@ -169,8 +158,7 @@ func (c *conn) SetDeadline(t time.Time) error {
 	if err := c.SetReadDeadline(t); err != nil {
 		return err
 	}
-	// return c.SetWriteDeadline(t)
-	return nil
+	return c.SetWriteDeadline(t)
 }
 
 // SetReadDeadline sets the deadline for future Read calls
@@ -180,7 +168,12 @@ func (c *conn) SetReadDeadline(t time.Time) error {
 	// stop and drain the current timer if not nil
 	if c.readTimer != nil {
 		if !c.readTimer.Stop() {
-			<-c.readTimer.C
+			select {
+			case <-c.readTimer.C:
+				// drain channel if needed
+			default:
+				// avoid blocking if channel is empty
+			}
 		}
 	}
 	// if the deadline is non zero, start a new timer
@@ -197,5 +190,5 @@ func (c *conn) SetReadDeadline(t time.Time) error {
 // some of the data was successfully written.
 // A zero value for t means Write will not time out.
 func (c *conn) SetWriteDeadline(t time.Time) error {
-	return fmt.Errorf("not implemented")
+	return fmt.Errorf("write deadlines not supported")
 }
