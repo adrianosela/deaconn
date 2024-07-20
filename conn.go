@@ -1,12 +1,15 @@
 package deaconn
 
 import (
+	"bytes"
 	"context"
-	"fmt"
 	"io"
 	"net"
 	"os"
+	"sync"
 	"time"
+
+	"github.com/adrianosela/deaconn/deadline"
 )
 
 const readBufferSize = 5242880 // 5 MB
@@ -17,19 +20,22 @@ type conn struct {
 	ctx       context.Context
 	ctxCancel context.CancelFunc
 
-	readTimer         *time.Timer
-	readTimerChange   chan struct{}
-	readDataAvailable chan []byte
+	rxMutex    sync.Mutex
+	rxData     chan []byte
+	rxDeadline deadline.Deadline
+
+	txMutex    sync.Mutex
+	txDeadline deadline.Deadline
+}
+
+type txResult struct {
+	n   int
+	err error
 }
 
 // WithDeadlines adds support for deadlines to a given net.Conn.
 func WithDeadlines(inner net.Conn) net.Conn {
 	ctx, ctxCancel := context.WithCancel(context.Background())
-
-	// initialize readTimer to a Stop()-ed timer
-	// (a timer that is non-nil but will never fire).
-	readTimer := time.NewTimer(time.Hour)
-	readTimer.Stop()
 
 	c := &conn{
 		inner: inner,
@@ -37,9 +43,12 @@ func WithDeadlines(inner net.Conn) net.Conn {
 		ctx:       ctx,
 		ctxCancel: ctxCancel,
 
-		readTimer:         readTimer,
-		readTimerChange:   make(chan struct{}),
-		readDataAvailable: make(chan []byte, 1000),
+		rxMutex:    sync.Mutex{},
+		rxData:     make(chan []byte),
+		rxDeadline: deadline.New(),
+
+		txMutex:    sync.Mutex{},
+		txDeadline: deadline.New(),
 	}
 
 	go c.continouslyReadIntoBuffer()
@@ -58,17 +67,15 @@ func (c *conn) continouslyReadIntoBuffer() {
 			return
 		default:
 			n, err := c.inner.Read(buf)
-			if n > 0 {
-				copied := make([]byte, n)
-				copy(copied, buf[:n])
-				c.readDataAvailable <- copied[:n]
-			} else {
-				c.readDataAvailable <- []byte{}
-			}
+
+			copied := make([]byte, n)
+			copy(copied, buf[:n])
+
+			c.rxData <- copied[:n]
+
 			if err != nil {
 				return
 			}
-
 		}
 	}
 }
@@ -77,18 +84,28 @@ func (c *conn) continouslyReadIntoBuffer() {
 // Read can be made to time out and return an error after a fixed
 // time limit; see SetDeadline and SetReadDeadline.
 func (c *conn) Read(b []byte) (int, error) {
-	for {
-		select {
-		case data := <-c.readDataAvailable:
-			// TODO: ensure b is big enough for data, e.g. write leftovers to buffer
-			return copy(b, data), nil
-		case <-c.readTimerChange:
-			continue
-		case <-c.readTimer.C:
-			return 0, os.ErrDeadlineExceeded
-		case <-c.ctx.Done():
+	c.rxMutex.Lock()
+	defer c.rxMutex.Unlock()
+
+	if b == nil {
+		return 0, nil
+	}
+
+	select {
+	// connection closed
+	case <-c.ctx.Done():
+		return 0, io.EOF
+	// deadline exceeded
+	case <-c.rxDeadline.Done():
+		return 0, os.ErrDeadlineExceeded
+	// data available or rxData channel closed
+	case data, ok := <-c.rxData:
+		if !ok {
 			return 0, io.EOF
 		}
+		// TODO: ensure b is big enough for data and if not
+		// write the leftovers to a buffer for the next read
+		return copy(b, data), nil
 	}
 }
 
@@ -96,31 +113,42 @@ func (c *conn) Read(b []byte) (int, error) {
 // Write can be made to time out and return an error after a fixed
 // time limit; see SetDeadline and SetWriteDeadline.
 func (c *conn) Write(b []byte) (n int, err error) {
-	return c.inner.Write(b)
+	c.txMutex.Lock()
+	defer c.txMutex.Unlock()
+
+	if b == nil {
+		return 0, nil
+	}
+
+	copied := make([]byte, len(b))
+	copy(copied, b)
+
+	txResultChan := make(chan txResult)
+	go func() {
+		defer close(txResultChan)
+
+		n, err := io.Copy(c.inner, bytes.NewReader(copied))
+		txResultChan <- txResult{int(n), err}
+	}()
+
+	select {
+	// connection closed
+	case <-c.ctx.Done():
+		return 0, io.EOF
+	// deadline exceeded
+	case <-c.txDeadline.Done():
+		return 0, os.ErrDeadlineExceeded
+	// write completed
+	case result := <-txResultChan:
+		return result.n, result.err
+	}
 }
 
 // Close closes the connection.
 func (c *conn) Close() error {
-	// close inner connection first
-	if err := c.inner.Close(); err != nil {
-		return err
-	}
-
-	// cancel all outstanding reads from the buffer
-	c.ctxCancel()
-
-	// drain the timer if needed
-	if c.readTimer != nil {
-		if !c.readTimer.Stop() {
-			<-c.readTimer.C
-		}
-	}
-
-	// close channels
-	close(c.readTimerChange)
-	close(c.readDataAvailable)
-
-	return nil
+	defer close(c.rxData)
+	defer c.ctxCancel()
+	return c.inner.Close()
 }
 
 // LocalAddr returns the local network address, if known.
@@ -165,23 +193,13 @@ func (c *conn) SetDeadline(t time.Time) error {
 // and any currently-blocked Read call.
 // A zero value for t means Read will not time out.
 func (c *conn) SetReadDeadline(t time.Time) error {
-	// stop and drain the current timer if not nil
-	if c.readTimer != nil {
-		if !c.readTimer.Stop() {
-			select {
-			case <-c.readTimer.C:
-				// drain channel if needed
-			default:
-				// avoid blocking if channel is empty
-			}
-		}
+	select {
+	case <-c.ctx.Done():
+		return net.ErrClosed
+	default:
+		c.rxDeadline.Set(t)
+		return nil
 	}
-	// if the deadline is non zero, start a new timer
-	if !t.IsZero() {
-		c.readTimer = time.NewTimer(time.Until(t))
-		c.readTimerChange <- struct{}{}
-	}
-	return nil
 }
 
 // SetWriteDeadline sets the deadline for future Write calls
@@ -190,5 +208,11 @@ func (c *conn) SetReadDeadline(t time.Time) error {
 // some of the data was successfully written.
 // A zero value for t means Write will not time out.
 func (c *conn) SetWriteDeadline(t time.Time) error {
-	return fmt.Errorf("write deadlines not supported")
+	select {
+	case <-c.ctx.Done():
+		return net.ErrClosed
+	default:
+		c.txDeadline.Set(t)
+		return nil
+	}
 }
