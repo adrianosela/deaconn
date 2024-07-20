@@ -146,7 +146,7 @@ func (c *conn) Write(b []byte) (n int, err error) {
 
 // Close closes the connection.
 func (c *conn) Close() error {
-	defer close(c.rxData)
+	defer safeCloseChannel(c.rxData)
 	defer c.ctxCancel()
 	return c.inner.Close()
 }
@@ -214,5 +214,16 @@ func (c *conn) SetWriteDeadline(t time.Time) error {
 	default:
 		c.txDeadline.Set(t)
 		return nil
+	}
+}
+
+func safeCloseChannel[T any](c chan T) {
+	select {
+	case _, stillOpen := <-c:
+		if stillOpen {
+			close(c)
+		}
+	default:
+		close(c)
 	}
 }
