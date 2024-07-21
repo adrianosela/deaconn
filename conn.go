@@ -97,7 +97,7 @@ func (c *conn) Read(b []byte) (int, error) {
 	default:
 		if len(c.rxDataPending) > 0 {
 			n := copy(b, c.rxDataPending[:len(b)])
-			c.rxDataPending = c.rxDataPending[:n] // adjust pending data
+			c.rxDataPending = c.rxDataPending[n:] // adjust pending data
 			return n, nil
 		}
 	}
@@ -119,8 +119,9 @@ func (c *conn) Read(b []byte) (int, error) {
 		// in the given buffer, we append the bytes to the pending
 		// data buffer to be read on the next Read() call.
 		if len(data) > len(b) {
-			c.rxDataPending = append(c.rxDataPending, data[:len(b)]...)
-			return copy(b, data[:len(b)]), nil
+			n := copy(b, data[:len(b)])
+			c.rxDataPending = append(c.rxDataPending, data[n:]...)
+			return n, nil
 		}
 
 		// all data fits, copy it entirely
