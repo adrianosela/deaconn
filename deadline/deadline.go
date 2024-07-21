@@ -68,10 +68,10 @@ func (d *deadline) Set(t time.Time) {
 		return
 	}
 
-	ttl := time.Until(t)
+	duration := time.Until(t)
 
 	// handle t in the past (fire immediately)
-	if ttl <= 0 {
+	if duration <= 0 {
 		if !doneIsClosed {
 			close(d.done)
 		}
@@ -82,5 +82,5 @@ func (d *deadline) Set(t time.Time) {
 	if !doneIsClosed {
 		d.done = make(chan struct{})
 	}
-	d.timer = time.AfterFunc(ttl, func() { close(d.done) })
+	d.timer = time.AfterFunc(duration, func() { close(d.done) })
 }

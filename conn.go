@@ -1,7 +1,6 @@
 package deaconn
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"net"
@@ -65,12 +64,11 @@ func (c *conn) continouslyReadIntoBuffer() {
 			return
 		default:
 			n, err := c.inner.Read(buf)
-
-			copied := make([]byte, n)
-			copy(copied, buf[:n])
-
-			c.rxData <- copied[:n]
-
+			if n > 0 {
+				copied := make([]byte, n)
+				copy(copied, buf[:n])
+				c.rxData <- copied[:n]
+			}
 			if err != nil {
 				return
 			}
@@ -96,7 +94,7 @@ func (c *conn) Read(b []byte) (int, error) {
 	// check for data in the pending data buffer
 	default:
 		if len(c.rxDataPending) > 0 {
-			n := copy(b, c.rxDataPending[:len(b)])
+			n := copy(b, c.rxDataPending)
 			c.rxDataPending = c.rxDataPending[n:] // adjust pending data
 			return n, nil
 		}
@@ -115,17 +113,14 @@ func (c *conn) Read(b []byte) (int, error) {
 			return 0, io.EOF
 		}
 
-		// if not all data from the inner connections Read() fits
-		// in the given buffer, we append the bytes to the pending
-		// data buffer to be read on the next Read() call.
-		if len(data) > len(b) {
-			n := copy(b, data[:len(b)])
+		n := copy(b, data)
+		if n < len(data) {
+			// if not all data fits in the given buffer,
+			// we append the bytes to the pending data
+			// buffer to be read on the next Read() call.
 			c.rxDataPending = append(c.rxDataPending, data[n:]...)
-			return n, nil
 		}
-
-		// all data fits, copy it entirely
-		return copy(b, data), nil
+		return n, nil
 	}
 }
 
@@ -144,7 +139,7 @@ func (c *conn) Write(b []byte) (n int, err error) {
 	go func() {
 		defer close(txResultChan)
 
-		n, err := io.Copy(c.inner, bytes.NewReader(copied))
+		n, err := c.inner.Write(copied)
 		txResultChan <- txResult{int(n), err}
 	}()
 
