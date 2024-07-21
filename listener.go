@@ -20,7 +20,7 @@ func (l *listener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return WithDeadlines(innerConn), nil
+	return NewConnWithDeadlines(innerConn), nil
 }
 
 // Close closes the listener.

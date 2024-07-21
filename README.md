@@ -58,7 +58,7 @@ defer wrappedListener()
 To wrap a single `net.Conn` to add deadline support to it:
 
 ```
-wrappedConn := deaconn.WithDeadlines(conn)
+wrappedConn := deaconn.NewConnWithDeadlines(conn)
 
 // use the wrappedConn as you would use your original conn
 ```
