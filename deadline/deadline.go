@@ -56,7 +56,7 @@ func (d *deadline) Set(t time.Time) {
 	case <-d.done:
 		doneIsClosed = true
 	default:
-		// default clause do ensure we don't block
+		// default clause to ensure we don't block
 	}
 
 	// handle the zero-time case as per the net.Conn spec:
@@ -70,7 +70,7 @@ func (d *deadline) Set(t time.Time) {
 
 	ttl := time.Until(t)
 
-	// handle t in the past (fire immediately).
+	// handle t in the past (fire immediately)
 	if ttl <= 0 {
 		if !doneIsClosed {
 			close(d.done)

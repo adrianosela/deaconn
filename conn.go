@@ -6,7 +6,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/adrianosela/deaconn/deadline"
@@ -14,23 +13,22 @@ import (
 
 const readBufferSize = 5242880 // 5 MB
 
+type txResult struct {
+	n   int
+	err error
+}
+
 type conn struct {
 	inner net.Conn
 
 	ctx       context.Context
 	ctxCancel context.CancelFunc
 
-	rxMutex    sync.Mutex
-	rxData     chan []byte
+	rxData        chan []byte
+	rxDataPending []byte
+
 	rxDeadline deadline.Deadline
-
-	txMutex    sync.Mutex
 	txDeadline deadline.Deadline
-}
-
-type txResult struct {
-	n   int
-	err error
 }
 
 // WithDeadlines adds support for deadlines to a given net.Conn.
@@ -43,11 +41,10 @@ func WithDeadlines(inner net.Conn) net.Conn {
 		ctx:       ctx,
 		ctxCancel: ctxCancel,
 
-		rxMutex:    sync.Mutex{},
-		rxData:     make(chan []byte),
-		rxDeadline: deadline.New(),
+		rxData:        make(chan []byte),
+		rxDataPending: []byte{},
 
-		txMutex:    sync.Mutex{},
+		rxDeadline: deadline.New(),
 		txDeadline: deadline.New(),
 	}
 
@@ -85,11 +82,24 @@ func (c *conn) continouslyReadIntoBuffer() {
 // Read can be made to time out and return an error after a fixed
 // time limit; see SetDeadline and SetReadDeadline.
 func (c *conn) Read(b []byte) (int, error) {
-	c.rxMutex.Lock()
-	defer c.rxMutex.Unlock()
-
 	if b == nil {
 		return 0, nil
+	}
+
+	select {
+	// connection closed
+	case <-c.ctx.Done():
+		return 0, io.EOF
+	// deadline exceeded
+	case <-c.rxDeadline.Done():
+		return 0, os.ErrDeadlineExceeded
+	// check for data in the pending data buffer
+	default:
+		if len(c.rxDataPending) > 0 {
+			n := copy(b, c.rxDataPending[:len(b)])
+			c.rxDataPending = c.rxDataPending[:n] // adjust pending data
+			return n, nil
+		}
 	}
 
 	select {
@@ -104,8 +114,16 @@ func (c *conn) Read(b []byte) (int, error) {
 		if !ok {
 			return 0, io.EOF
 		}
-		// TODO: ensure b is big enough for data and if not
-		// write the leftovers to a buffer for the next read
+
+		// if not all data from the inner connections Read() fits
+		// in the given buffer, we append the bytes to the pending
+		// data buffer to be read on the next Read() call.
+		if len(data) > len(b) {
+			c.rxDataPending = append(c.rxDataPending, data[:len(b)]...)
+			return copy(b, data[:len(b)]), nil
+		}
+
+		// all data fits, copy it entirely
 		return copy(b, data), nil
 	}
 }
@@ -114,9 +132,6 @@ func (c *conn) Read(b []byte) (int, error) {
 // Write can be made to time out and return an error after a fixed
 // time limit; see SetDeadline and SetWriteDeadline.
 func (c *conn) Write(b []byte) (n int, err error) {
-	c.txMutex.Lock()
-	defer c.txMutex.Unlock()
-
 	if b == nil {
 		return 0, nil
 	}
