@@ -79,7 +79,7 @@ func (d *deadline) Set(t time.Time) {
 	}
 
 	// handle t in the future (fire after ttl)
-	if !doneIsClosed {
+	if doneIsClosed {
 		d.done = make(chan struct{})
 	}
 	d.timer = time.AfterFunc(duration, func() { close(d.done) })
